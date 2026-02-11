@@ -15,6 +15,7 @@ import email.utils
 import imaplib
 import logging
 import re
+import ssl
 import sys
 from datetime import datetime, timezone
 from email.message import Message
@@ -477,7 +478,12 @@ def connect_imap(config: configparser.SectionProxy) -> imaplib.IMAP4 | imaplib.I
     use_ssl = config.getboolean("ssl", True)
 
     if use_ssl:
-        imap = imaplib.IMAP4_SSL(host, port)
+        # Python 3.10+ prohibits RSA encryption by default.
+        # Some IMAP servers (particularly legacy hosts) still require it.
+        # Using DEFAULT restores compatibility with these servers.
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers("DEFAULT")
+        imap = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
     else:
         imap = imaplib.IMAP4(host, port)
 
