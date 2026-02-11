@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS folders (
     name          VARCHAR(255)  NOT NULL,
     full_path     VARCHAR(1024) NOT NULL,
     parent_id     BIGINT        UNSIGNED NULL,
-    delimiter     VARCHAR(10)   NULL,
+    `delimiter`   VARCHAR(10)   NULL,
     UNIQUE KEY    uq_full_path (full_path),
     CONSTRAINT fk_folders_parent FOREIGN KEY (parent_id)
         REFERENCES folders(id) ON DELETE CASCADE
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS attachments (
 """
 
 SQL_GET_OR_CREATE_FOLDER = """
-INSERT IGNORE INTO folders (name, full_path, parent_id, delimiter)
+INSERT IGNORE INTO folders (name, full_path, parent_id, `delimiter`)
 VALUES (%s, %s, %s, %s)
 """
 
