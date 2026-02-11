@@ -8,6 +8,7 @@ text and HTML.
 """
 
 import argparse
+import base64
 import configparser
 import email
 import email.header
@@ -265,6 +266,34 @@ def parse_message_id(raw: str | None) -> str | None:
     return raw if raw else None
 
 
+def decode_imap_utf7(s: str) -> str:
+    """Decodes IMAP modified UTF-7 (RFC 3501) into Unicode.
+
+    Converts encoded names like '&2Dzfpw- Deezer' to '🎧 Deezer'.
+    Returns the original string on decode errors.
+    """
+    if not s or "&" not in s:
+        return s
+    try:
+
+        def b64padanddecode(b: str) -> str:
+            b += (-len(b) % 4) * "="
+            return base64.b64decode(b, altchars=b"+,", validate=True).decode("utf-16-be")
+
+        parts = s.split("&")
+        out = parts[0]
+        for e in parts[1:]:
+            u, a = (e.split("-", 1) if "-" in e else (e, ""))
+            if u == "":
+                out += "&"
+            else:
+                out += b64padanddecode(u)
+            out += a
+        return out
+    except Exception:
+        return s
+
+
 def parse_message_ids(raw: str | None) -> list[str]:
     """Extracts a list of Message-IDs from a References-style header.
 
@@ -323,26 +352,29 @@ def init_database(conn: mysql.connector.MySQLConnection) -> None:
 
 def get_or_create_folder(
     conn: mysql.connector.MySQLConnection,
-    full_path: str,
+    decoded_path: str,
     delimiter: str | None,
     folder_cache: dict[str, int],
 ) -> int:
     """Returns the folder id, creating the full folder hierarchy if needed.
 
-    For example, given ``full_path="INBOX/A/B"`` and ``delimiter="/"``,
-    the function ensures that rows for ``INBOX``, ``INBOX/A`` and
-    ``INBOX/A/B`` all exist, with correct ``parent_id`` links.
+    Uses decoded_path (Unicode) for DB storage so names like '🎧 Deezer'
+    are stored instead of '&2Dzfpw- Deezer'.
+
+    For example, given ``decoded_path="INBOX/🎧 Deezer"`` and ``delimiter="/"``,
+    the function ensures that rows for ``INBOX`` and ``INBOX/🎧 Deezer``
+    exist, with correct ``parent_id`` links.
     """
-    if full_path in folder_cache:
-        return folder_cache[full_path]
+    if decoded_path in folder_cache:
+        return folder_cache[decoded_path]
 
     cursor = conn.cursor()
     try:
         # Determine the parts of the hierarchy
-        if delimiter and delimiter in full_path:
-            parts = full_path.split(delimiter)
+        if delimiter and delimiter in decoded_path:
+            parts = decoded_path.split(delimiter)
         else:
-            parts = [full_path]
+            parts = [decoded_path]
 
         parent_id: int | None = None
         accumulated_path = ""
@@ -375,7 +407,7 @@ def get_or_create_folder(
             folder_cache[accumulated_path] = folder_id
             parent_id = folder_id
 
-        return folder_cache[full_path]
+        return folder_cache[decoded_path]
     finally:
         cursor.close()
 
@@ -534,28 +566,38 @@ def parse_imap_list_response(raw_line: bytes | str) -> tuple[str, str | None]:
 
 def get_folders(
     imap: imaplib.IMAP4, config_folders: str,
-) -> list[tuple[str, str | None]]:
-    """Returns the list of ``(folder_path, delimiter)`` to process."""
+) -> list[tuple[str, str, str | None]]:
+    """Returns the list of ``(encoded_path, decoded_path, delimiter)`` to process.
+
+    encoded_path: used for IMAP SELECT/operations (server expects UTF-7 encoded).
+    decoded_path: used for DB storage and display (Unicode e.g. 🎧 Deezer).
+    """
     status, data = imap.list()
     if status != "OK":
         log.error("Unable to list IMAP folders.")
         return []
 
     # Build a map of all folders with their delimiter
-    all_folders: list[tuple[str, str | None]] = []
+    all_folders: list[tuple[str, str, str | None]] = []
     for item in data:
-        name, delim = parse_imap_list_response(item)
-        if name:
-            all_folders.append((name, delim))
+        name_encoded, delim = parse_imap_list_response(item)
+        if name_encoded:
+            name_decoded = decode_imap_utf7(name_encoded)
+            all_folders.append((name_encoded, name_decoded, delim))
 
     # If specific folders are configured, filter the list
     if config_folders.strip():
-        requested = {f.strip() for f in config_folders.split(",") if f.strip()}
-        # Keep configured folders; fall back to "/" delimiter if not found
-        result: list[tuple[str, str | None]] = []
-        delim_map = {name: delim for name, delim in all_folders}
+        requested = [f.strip() for f in config_folders.split(",") if f.strip()]
+        result: list[tuple[str, str, str | None]] = []
         for req in requested:
-            result.append((req, delim_map.get(req)))
+            for enc, dec, delim in all_folders:
+                if enc == req or dec == req:
+                    result.append((enc, dec, delim))
+                    break
+            else:
+                # Requested folder not in list; use as-is (may be encoded or decoded)
+                dec = decode_imap_utf7(req)
+                result.append((req, dec, None))
         return result
 
     return all_folders
@@ -581,23 +623,27 @@ def count_folder_messages(
 def fetch_emails_from_folder(
     imap: imaplib.IMAP4,
     conn: mysql.connector.MySQLConnection,
-    folder: str,
+    encoded_path: str,
     folder_id: int,
     batch_size: int,
     skip_existing: bool,
     pbar_total: tqdm,
+    display_name: str | None = None,
 ) -> tuple[int, int]:
     """Fetches and inserts all emails from an IMAP folder.
     Returns (inserted_count, total_count).
+    encoded_path: used for IMAP SELECT (server expects UTF-7).
+    display_name: optional decoded name for progress bar (default: encoded_path).
     """
+    display = display_name or encoded_path
     try:
-        status, _ = imap.select(f'"{folder}"', readonly=True)
+        status, _ = imap.select(f'"{encoded_path}"', readonly=True)
     except imaplib.IMAP4.error as exc:
-        tqdm.write(f"WARNING: Unable to select folder '{folder}': {exc}")
+        tqdm.write(f"WARNING: Unable to select folder '{display}': {exc}")
         return 0, 0
 
     if status != "OK":
-        tqdm.write(f"WARNING: Unable to select folder '{folder}'.")
+        tqdm.write(f"WARNING: Unable to select folder '{display}'.")
         return 0, 0
 
     status, data = imap.search(None, "ALL")
@@ -610,7 +656,7 @@ def fetch_emails_from_folder(
 
     with tqdm(
         total=total,
-        desc=folder,
+        desc=display,
         unit="msg",
         position=1,
         leave=False,
@@ -622,7 +668,7 @@ def fetch_emails_from_folder(
             status, messages_data = imap.fetch(msg_set, "(RFC822)")
             if status != "OK":
                 tqdm.write(
-                    f"WARNING: Error fetching from '{folder}' (batch {i})."
+                    f"WARNING: Error fetching from '{display}' (batch {i})."
                 )
                 pbar_folder.update(len(batch))
                 pbar_total.update(len(batch))
@@ -642,7 +688,7 @@ def fetch_emails_from_folder(
                         inserted += 1
                 except Exception as exc:
                     tqdm.write(
-                        f"ERROR: Error processing message in '{folder}': {exc}"
+                        f"ERROR: Error processing message in '{display}': {exc}"
                     )
 
                 batch_processed += 1
@@ -714,22 +760,22 @@ def main() -> None:
         db_conn.close()
         sys.exit(0)
 
-    log.info("Folders to process: %s", ", ".join(f for f, _ in folders))
+    log.info("Folders to process: %s", ", ".join(dec for _, dec, _ in folders))
 
-    # Cache for folder path -> folder id mapping
+    # Cache for folder path -> folder id mapping (decoded paths)
     folder_cache: dict[str, int] = {}
 
     # Phase 1: count messages per folder and resolve folder ids
-    folder_infos: list[tuple[str, str | None, int, int]] = []
+    folder_infos: list[tuple[str, str, str | None, int, int]] = []
     log.info("Counting messages per folder...")
-    for folder_path, delimiter in folders:
+    for encoded_path, decoded_path, delimiter in folders:
         folder_id = get_or_create_folder(
-            db_conn, folder_path, delimiter, folder_cache,
+            db_conn, decoded_path, delimiter, folder_cache,
         )
-        msg_count = count_folder_messages(imap, folder_path)
-        folder_infos.append((folder_path, delimiter, folder_id, msg_count))
+        msg_count = count_folder_messages(imap, encoded_path)
+        folder_infos.append((encoded_path, decoded_path, delimiter, folder_id, msg_count))
 
-    total_messages = sum(c for _, _, _, c in folder_infos)
+    total_messages = sum(c for _, _, _, _, c in folder_infos)
     log.info("Total: %d message(s) across %d folder(s).",
              total_messages, len(folder_infos))
 
@@ -742,12 +788,13 @@ def main() -> None:
         unit="msg",
         position=0,
     ) as pbar_total:
-        for folder_path, delimiter, folder_id, msg_count in folder_infos:
+        for encoded_path, decoded_path, delimiter, folder_id, msg_count in folder_infos:
             if msg_count == 0:
                 continue
             inserted, count = fetch_emails_from_folder(
-                imap, db_conn, folder_path, folder_id,
+                imap, db_conn, encoded_path, folder_id,
                 batch_size, skip_existing, pbar_total,
+                display_name=decoded_path,
             )
             total_inserted += inserted
             pbar_total.set_postfix(inserted=total_inserted)
