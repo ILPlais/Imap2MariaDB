@@ -22,6 +22,7 @@ from email.message import Message
 import chardet
 import mysql.connector
 from mysql.connector import Error as MySQLError
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -554,6 +555,23 @@ def get_folders(
     return all_folders
 
 
+def count_folder_messages(
+    imap: imaplib.IMAP4,
+    folder: str,
+) -> int:
+    """Selects an IMAP folder and returns its message count."""
+    try:
+        status, _ = imap.select(f'"{folder}"', readonly=True)
+    except imaplib.IMAP4.error:
+        return 0
+    if status != "OK":
+        return 0
+    status, data = imap.search(None, "ALL")
+    if status != "OK" or not data[0]:
+        return 0
+    return len(data[0].split())
+
+
 def fetch_emails_from_folder(
     imap: imaplib.IMAP4,
     conn: mysql.connector.MySQLConnection,
@@ -561,6 +579,7 @@ def fetch_emails_from_folder(
     folder_id: int,
     batch_size: int,
     skip_existing: bool,
+    pbar_total: tqdm,
 ) -> tuple[int, int]:
     """Fetches and inserts all emails from an IMAP folder.
     Returns (inserted_count, total_count).
@@ -568,53 +587,63 @@ def fetch_emails_from_folder(
     try:
         status, _ = imap.select(f'"{folder}"', readonly=True)
     except imaplib.IMAP4.error as exc:
-        log.warning("Unable to select folder '%s': %s", folder, exc)
+        tqdm.write(f"WARNING: Unable to select folder '{folder}': {exc}")
         return 0, 0
 
     if status != "OK":
-        log.warning("Unable to select folder '%s'.", folder)
+        tqdm.write(f"WARNING: Unable to select folder '{folder}'.")
         return 0, 0
 
     status, data = imap.search(None, "ALL")
     if status != "OK" or not data[0]:
-        log.info("Folder '%s': no messages.", folder)
         return 0, 0
 
     msg_nums = data[0].split()
     total = len(msg_nums)
     inserted = 0
 
-    log.info("Folder '%s': %d message(s) to process.", folder, total)
+    with tqdm(
+        total=total,
+        desc=folder,
+        unit="msg",
+        position=1,
+        leave=False,
+    ) as pbar_folder:
+        for i in range(0, total, batch_size):
+            batch = msg_nums[i : i + batch_size]
+            msg_set = b",".join(batch)
 
-    # Batch processing
-    for i in range(0, total, batch_size):
-        batch = msg_nums[i : i + batch_size]
-        # Build query with UID range
-        msg_set = b",".join(batch)
-
-        status, messages_data = imap.fetch(msg_set, "(RFC822)")
-        if status != "OK":
-            log.warning("Error fetching from '%s' (batch %d).", folder, i)
-            continue
-
-        for response_part in messages_data:
-            if not isinstance(response_part, tuple):
+            status, messages_data = imap.fetch(msg_set, "(RFC822)")
+            if status != "OK":
+                tqdm.write(
+                    f"WARNING: Error fetching from '{folder}' (batch {i})."
+                )
+                pbar_folder.update(len(batch))
+                pbar_total.update(len(batch))
                 continue
-            raw_email = response_part[1]
-            if not isinstance(raw_email, bytes):
-                continue
 
-            try:
-                msg = email.message_from_bytes(raw_email)
-                if insert_email(conn, folder_id, raw_email, msg, skip_existing):
-                    inserted += 1
-            except Exception as exc:
-                log.error("Error processing message in '%s': %s",
-                          folder, exc)
+            batch_processed = 0
+            for response_part in messages_data:
+                if not isinstance(response_part, tuple):
+                    continue
+                raw_email = response_part[1]
+                if not isinstance(raw_email, bytes):
+                    continue
 
-        processed = min(i + batch_size, total)
-        log.info("  Folder '%s': %d/%d processed, %d inserted.",
-                 folder, processed, total, inserted)
+                try:
+                    msg = email.message_from_bytes(raw_email)
+                    if insert_email(conn, folder_id, raw_email, msg, skip_existing):
+                        inserted += 1
+                except Exception as exc:
+                    tqdm.write(
+                        f"ERROR: Error processing message in '{folder}': {exc}"
+                    )
+
+                batch_processed += 1
+                pbar_folder.update(1)
+                pbar_total.update(1)
+
+            pbar_folder.set_postfix(inserted=inserted)
 
     return inserted, total
 
@@ -684,18 +713,38 @@ def main() -> None:
     # Cache for folder path -> folder id mapping
     folder_cache: dict[str, int] = {}
 
-    total_inserted = 0
-    total_messages = 0
-
+    # Phase 1: count messages per folder and resolve folder ids
+    folder_infos: list[tuple[str, str | None, int, int]] = []
+    log.info("Counting messages per folder...")
     for folder_path, delimiter in folders:
         folder_id = get_or_create_folder(
             db_conn, folder_path, delimiter, folder_cache,
         )
-        inserted, count = fetch_emails_from_folder(
-            imap, db_conn, folder_path, folder_id, batch_size, skip_existing,
-        )
-        total_inserted += inserted
-        total_messages += count
+        msg_count = count_folder_messages(imap, folder_path)
+        folder_infos.append((folder_path, delimiter, folder_id, msg_count))
+
+    total_messages = sum(c for _, _, _, c in folder_infos)
+    log.info("Total: %d message(s) across %d folder(s).",
+             total_messages, len(folder_infos))
+
+    # Phase 2: process with progress bars
+    total_inserted = 0
+
+    with tqdm(
+        total=total_messages,
+        desc="Total",
+        unit="msg",
+        position=0,
+    ) as pbar_total:
+        for folder_path, delimiter, folder_id, msg_count in folder_infos:
+            if msg_count == 0:
+                continue
+            inserted, count = fetch_emails_from_folder(
+                imap, db_conn, folder_path, folder_id,
+                batch_size, skip_existing, pbar_total,
+            )
+            total_inserted += inserted
+            pbar_total.set_postfix(inserted=total_inserted)
 
     # Cleanup
     try:
