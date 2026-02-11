@@ -87,21 +87,56 @@ python imap2mariadb.py -v
 
 ## Database schema
 
+### Table `folders`
+
+Stores the IMAP folder tree. Each folder references its parent via `parent_id`, forming a hierarchy.
+
+| Column    | Type          | Description                                     |
+|-----------|---------------|-------------------------------------------------|
+| id        | BIGINT        | Auto-increment primary key                      |
+| name      | VARCHAR(255)  | Folder leaf name (e.g. `Subfolder`)             |
+| full_path | VARCHAR(1024) | Full IMAP path (e.g. `INBOX/Subfolder`), unique |
+| parent_id | BIGINT        | Reference to parent `folders.id` (NULL = root)  |
+| delimiter | VARCHAR(10)   | IMAP hierarchy delimiter (e.g. `/` or `.`)      |
+
 ### Table `emails`
 
-| Column        | Type         | Description                         |
-|---------------|--------------|-------------------------------------|
-| id            | BIGINT       | Auto-increment primary key          |
-| message_id    | VARCHAR(512) | Message-ID header                   |
-| folder        | VARCHAR(255) | Source IMAP folder                  |
-| subject       | TEXT         | Message subject                      |
-| sender_name   | VARCHAR(512) | Sender name                          |
-| sender_address| VARCHAR(512) | Sender address                       |
-| date_sent     | DATETIME     | Sent date (UTC)                      |
-| body_text     | LONGTEXT     | Plain text body                      |
-| body_html     | LONGTEXT     | HTML body                            |
-| raw_source    | LONGBLOB     | Complete raw source (RFC822)         |
-| created_at    | DATETIME     | Insertion date in database           |
+| Column        | Type         | Description                                           |
+|---------------|--------------|-------------------------------------------------------|
+| id            | BIGINT       | Auto-increment primary key                            |
+| message_id    | VARCHAR(512) | Message-ID header                                     |
+| folder_id     | BIGINT       | Reference to `folders.id`                             |
+| subject       | TEXT         | Message subject                                       |
+| sender_name   | VARCHAR(512) | Sender name                                           |
+| sender_address| VARCHAR(512) | Sender address                                        |
+| date_sent     | DATETIME     | Sent date (UTC)                                       |
+| in_reply_to   | VARCHAR(512) | Message-ID from the In-Reply-To header (indexed)      |
+| body_text     | LONGTEXT     | Plain text body                                       |
+| body_html     | LONGTEXT     | HTML body                                             |
+| raw_source    | LONGBLOB     | Complete raw source (RFC822)                          |
+| created_at    | DATETIME     | Insertion date in database                            |
+
+Threading relationships are stored as Message-ID strings, not as foreign keys
+to `emails.id`. This means **deleting an email never cascades to related emails**
+in the conversation thread. You can reconstruct threads by joining on
+`emails.message_id = emails.in_reply_to` or via the `email_references` table.
+
+### Table `email_references`
+
+Stores the ordered list of Message-IDs from the `References` header. Each row
+links a stored email to a referenced Message-ID, preserving the conversation chain.
+
+| Column                | Type         | Description                                 |
+|-----------------------|--------------|---------------------------------------------|
+| id                    | BIGINT       | Auto-increment primary key                  |
+| email_id              | BIGINT       | Reference to `emails.id` (CASCADE on delete)|
+| referenced_message_id | VARCHAR(512) | Message-ID from the References header       |
+| position              | INT          | 0-based position in the References chain    |
+
+When an email record is deleted, its `email_references` rows are cascaded.
+However, because `referenced_message_id` is a plain string (not a FK to
+`emails.id`), **deleting an email does not affect other emails that reference
+it or that it references**.
 
 ### Table `recipients`
 

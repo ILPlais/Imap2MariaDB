@@ -14,6 +14,7 @@ import email.header
 import email.utils
 import imaplib
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from email.message import Message
@@ -35,20 +36,49 @@ log = logging.getLogger("imap2mariadb")
 # ---------------------------------------------------------------------------
 # SQL Schema
 # ---------------------------------------------------------------------------
+SQL_CREATE_FOLDERS = """
+CREATE TABLE IF NOT EXISTS folders (
+    id            BIGINT        UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name          VARCHAR(255)  NOT NULL,
+    full_path     VARCHAR(1024) NOT NULL,
+    parent_id     BIGINT        UNSIGNED NULL,
+    delimiter     VARCHAR(10)   NULL,
+    UNIQUE KEY    uq_full_path (full_path),
+    CONSTRAINT fk_folders_parent FOREIGN KEY (parent_id)
+        REFERENCES folders(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"""
+
 SQL_CREATE_EMAILS = """
 CREATE TABLE IF NOT EXISTS emails (
     id            BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     message_id    VARCHAR(512) NULL,
-    folder        VARCHAR(255) NOT NULL,
+    folder_id     BIGINT       UNSIGNED NOT NULL,
     subject       TEXT         NULL,
     sender_name   VARCHAR(512) NULL,
     sender_address VARCHAR(512) NULL,
     date_sent     DATETIME     NULL,
+    in_reply_to   VARCHAR(512) NULL,
     body_text     LONGTEXT     NULL,
     body_html     LONGTEXT     NULL,
     raw_source    LONGBLOB     NOT NULL,
     created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY    uq_message_id_folder (message_id, folder)
+    UNIQUE KEY    uq_message_id_folder (message_id, folder_id),
+    INDEX         idx_in_reply_to (in_reply_to),
+    CONSTRAINT fk_emails_folder FOREIGN KEY (folder_id)
+        REFERENCES folders(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"""
+
+SQL_CREATE_EMAIL_REFERENCES = """
+CREATE TABLE IF NOT EXISTS email_references (
+    id                    BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email_id              BIGINT       UNSIGNED NOT NULL,
+    referenced_message_id VARCHAR(512) NOT NULL,
+    position              INT          UNSIGNED NOT NULL,
+    CONSTRAINT fk_emailref_email FOREIGN KEY (email_id)
+        REFERENCES emails(id) ON DELETE CASCADE,
+    INDEX idx_referenced_message_id (referenced_message_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
@@ -76,11 +106,25 @@ CREATE TABLE IF NOT EXISTS attachments (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
+SQL_GET_OR_CREATE_FOLDER = """
+INSERT IGNORE INTO folders (name, full_path, parent_id, delimiter)
+VALUES (%s, %s, %s, %s)
+"""
+
+SQL_GET_FOLDER_ID = """
+SELECT id FROM folders WHERE full_path = %s LIMIT 1
+"""
+
 SQL_INSERT_EMAIL = """
 INSERT INTO emails
-    (message_id, folder, subject, sender_name, sender_address, date_sent,
-     body_text, body_html, raw_source)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    (message_id, folder_id, subject, sender_name, sender_address, date_sent,
+     in_reply_to, body_text, body_html, raw_source)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+SQL_INSERT_EMAIL_REFERENCE = """
+INSERT INTO email_references (email_id, referenced_message_id, position)
+VALUES (%s, %s, %s)
 """
 
 SQL_INSERT_RECIPIENT = """
@@ -94,7 +138,7 @@ VALUES (%s, %s, %s, %s)
 """
 
 SQL_CHECK_EXISTS = """
-SELECT 1 FROM emails WHERE message_id = %s AND folder = %s LIMIT 1
+SELECT 1 FROM emails WHERE message_id = %s AND folder_id = %s LIMIT 1
 """
 
 # ---------------------------------------------------------------------------
@@ -211,6 +255,38 @@ def extract_attachments(msg: Message) -> list[tuple[str | None, str | None, int 
     return attachments
 
 
+def parse_message_id(raw: str | None) -> str | None:
+    """Extracts a single Message-ID, stripping angle brackets and whitespace."""
+    if not raw:
+        return None
+    raw = raw.strip().strip("<>").strip()
+    return raw if raw else None
+
+
+def parse_message_ids(raw: str | None) -> list[str]:
+    """Extracts a list of Message-IDs from a References-style header.
+
+    The References header contains space-separated Message-IDs enclosed
+    in angle brackets, e.g.::
+
+        <id1@host> <id2@host> <id3@host>
+    """
+    if not raw:
+        return []
+    ids: list[str] = []
+    for match in re.finditer(r"<([^>]+)>", raw):
+        mid = match.group(1).strip()
+        if mid:
+            ids.append(mid)
+    # Fallback: if no angle brackets found, try whitespace split
+    if not ids:
+        for token in raw.split():
+            token = token.strip("<>").strip()
+            if token:
+                ids.append(token)
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -233,7 +309,9 @@ def get_db_connection(config: configparser.SectionProxy) -> mysql.connector.MySQ
 def init_database(conn: mysql.connector.MySQLConnection) -> None:
     """Creates tables if they do not exist."""
     cursor = conn.cursor()
+    cursor.execute(SQL_CREATE_FOLDERS)
     cursor.execute(SQL_CREATE_EMAILS)
+    cursor.execute(SQL_CREATE_EMAIL_REFERENCES)
     cursor.execute(SQL_CREATE_RECIPIENTS)
     cursor.execute(SQL_CREATE_ATTACHMENTS)
     conn.commit()
@@ -241,17 +319,76 @@ def init_database(conn: mysql.connector.MySQLConnection) -> None:
     log.info("Database schema verified / created.")
 
 
-def email_exists(cursor, message_id: str | None, folder: str) -> bool:
+def get_or_create_folder(
+    conn: mysql.connector.MySQLConnection,
+    full_path: str,
+    delimiter: str | None,
+    folder_cache: dict[str, int],
+) -> int:
+    """Returns the folder id, creating the full folder hierarchy if needed.
+
+    For example, given ``full_path="INBOX/A/B"`` and ``delimiter="/"``,
+    the function ensures that rows for ``INBOX``, ``INBOX/A`` and
+    ``INBOX/A/B`` all exist, with correct ``parent_id`` links.
+    """
+    if full_path in folder_cache:
+        return folder_cache[full_path]
+
+    cursor = conn.cursor()
+    try:
+        # Determine the parts of the hierarchy
+        if delimiter and delimiter in full_path:
+            parts = full_path.split(delimiter)
+        else:
+            parts = [full_path]
+
+        parent_id: int | None = None
+        accumulated_path = ""
+
+        for i, part in enumerate(parts):
+            if accumulated_path:
+                accumulated_path += delimiter + part
+            else:
+                accumulated_path = part
+
+            # Fast path: already cached
+            if accumulated_path in folder_cache:
+                parent_id = folder_cache[accumulated_path]
+                continue
+
+            # Check if it already exists in DB
+            cursor.execute(SQL_GET_FOLDER_ID, (accumulated_path,))
+            row = cursor.fetchone()
+            if row:
+                folder_id = row[0]
+            else:
+                cursor.execute(SQL_GET_OR_CREATE_FOLDER, (
+                    part, accumulated_path, parent_id, delimiter,
+                ))
+                conn.commit()
+                cursor.execute(SQL_GET_FOLDER_ID, (accumulated_path,))
+                row = cursor.fetchone()
+                folder_id = row[0]
+
+            folder_cache[accumulated_path] = folder_id
+            parent_id = folder_id
+
+        return folder_cache[full_path]
+    finally:
+        cursor.close()
+
+
+def email_exists(cursor, message_id: str | None, folder_id: int) -> bool:
     """Checks if an email with this Message-ID already exists in this folder."""
     if not message_id:
         return False
-    cursor.execute(SQL_CHECK_EXISTS, (message_id, folder))
+    cursor.execute(SQL_CHECK_EXISTS, (message_id, folder_id))
     return cursor.fetchone() is not None
 
 
 def insert_email(
     conn: mysql.connector.MySQLConnection,
-    folder: str,
+    folder_id: int,
     raw_bytes: bytes,
     msg: Message,
     skip_existing: bool,
@@ -264,7 +401,7 @@ def insert_email(
             # Strip angle brackets
             message_id = message_id.strip("<>")
 
-        if skip_existing and email_exists(cursor, message_id, folder):
+        if skip_existing and email_exists(cursor, message_id, folder_id):
             return False
 
         subject = decode_header_value(msg.get("Subject"))
@@ -273,22 +410,32 @@ def insert_email(
         sender_address = sender[0][1] if sender else None
         date_sent = parse_date(msg.get("Date"))
 
+        in_reply_to = parse_message_id(msg.get("In-Reply-To"))
+        references = parse_message_ids(msg.get("References"))
+
         body_text, body_html = extract_bodies(msg)
         attachments = extract_attachments(msg)
 
         # Insert email
         cursor.execute(SQL_INSERT_EMAIL, (
             message_id,
-            folder,
+            folder_id,
             subject or None,
             sender_name or None,
             sender_address or None,
             date_sent,
+            in_reply_to,
             body_text or None,
             body_html or None,
             raw_bytes,
         ))
         email_id = cursor.lastrowid
+
+        # Insert references (threading chain)
+        for pos, ref_mid in enumerate(references):
+            cursor.execute(SQL_INSERT_EMAIL_REFERENCE, (
+                email_id, ref_mid, pos,
+            ))
 
         # Insert recipients
         for header_type in ("From", "To", "Cc", "Bcc", "Reply-To"):
@@ -310,8 +457,8 @@ def insert_email(
         conn.rollback()
         # Duplicate: message already present (unique constraint)
         if exc.errno == 1062:
-            log.debug("Duplicate ignored: Message-ID=%s folder=%s",
-                      msg.get("Message-ID", "?"), folder)
+            log.debug("Duplicate ignored: Message-ID=%s folder_id=%d",
+                      msg.get("Message-ID", "?"), folder_id)
             return False
         raise
     finally:
@@ -340,77 +487,78 @@ def connect_imap(config: configparser.SectionProxy) -> imaplib.IMAP4 | imaplib.I
     return imap
 
 
-def list_folders(imap: imaplib.IMAP4) -> list[str]:
-    """Lists all available IMAP folders."""
-    status, data = imap.list()
-    if status != "OK":
-        log.error("Unable to list IMAP folders.")
-        return []
+def parse_imap_list_response(raw_line: bytes | str) -> tuple[str, str | None]:
+    """Parses an IMAP LIST response line.
 
-    folders: list[str] = []
-    for item in data:
-        if isinstance(item, bytes):
-            item = item.decode("utf-8", errors="replace")
-        # Format is: (\\Flags) "delimiter" "folder_name"
-        # Extract folder name
-        parts = item.rsplit('"', 2)
-        if len(parts) >= 2:
-            folder_name = parts[-1].strip()
-            if not folder_name:
-                # Try another format: without trailing quotes
-                folder_name = parts[-2].strip()
-        else:
-            folder_name = item.split()[-1].strip('"')
+    Returns ``(folder_name, delimiter)``.  The delimiter is ``None``
+    when the server indicates NIL.
 
-        if folder_name:
-            folders.append(folder_name)
+    Example input::
 
-    return folders
-
-
-def parse_imap_folder_name(raw_line: bytes | str) -> str:
-    """Extracts folder name from an IMAP LIST response line."""
+        (\\HasNoChildren) "/" "INBOX/Subfolder"
+        (\\HasNoChildren) "." INBOX.Subfolder
+    """
     if isinstance(raw_line, bytes):
         raw_line = raw_line.decode("utf-8", errors="replace")
-    # Format: (\\Flags) "sep" name  or  (\\Flags) "sep" "name with spaces"
-    # Look for content after the delimiter
-    idx = raw_line.find(') "')
+
+    # --- extract flags part between ( and ) ---
+    idx = raw_line.find(") ")
     if idx == -1:
-        idx = raw_line.find(") ")
-    if idx == -1:
-        return raw_line.split()[-1].strip('"')
+        return raw_line.split()[-1].strip('"'), None
 
     rest = raw_line[idx + 2:].strip()
-    # Skip the delimiter in quotes: "." or "/"
+
+    # --- extract delimiter ---
+    delimiter: str | None = None
     if rest.startswith('"'):
         end_delim = rest.index('"', 1)
+        delimiter = rest[1:end_delim]
         rest = rest[end_delim + 1:].strip()
+    elif rest.upper().startswith("NIL"):
+        rest = rest[3:].strip()
+    else:
+        # Non-quoted single character delimiter
+        delimiter = rest[0]
+        rest = rest[1:].strip()
 
-    return rest.strip('"')
+    folder_name = rest.strip('"')
+    return folder_name, delimiter
 
 
-def get_folders(imap: imaplib.IMAP4, config_folders: str) -> list[str]:
-    """Returns the list of folders to process."""
-    if config_folders.strip():
-        return [f.strip() for f in config_folders.split(",") if f.strip()]
-
+def get_folders(
+    imap: imaplib.IMAP4, config_folders: str,
+) -> list[tuple[str, str | None]]:
+    """Returns the list of ``(folder_path, delimiter)`` to process."""
     status, data = imap.list()
     if status != "OK":
         log.error("Unable to list IMAP folders.")
         return []
 
-    folders: list[str] = []
+    # Build a map of all folders with their delimiter
+    all_folders: list[tuple[str, str | None]] = []
     for item in data:
-        name = parse_imap_folder_name(item)
+        name, delim = parse_imap_list_response(item)
         if name:
-            folders.append(name)
-    return folders
+            all_folders.append((name, delim))
+
+    # If specific folders are configured, filter the list
+    if config_folders.strip():
+        requested = {f.strip() for f in config_folders.split(",") if f.strip()}
+        # Keep configured folders; fall back to "/" delimiter if not found
+        result: list[tuple[str, str | None]] = []
+        delim_map = {name: delim for name, delim in all_folders}
+        for req in requested:
+            result.append((req, delim_map.get(req)))
+        return result
+
+    return all_folders
 
 
 def fetch_emails_from_folder(
     imap: imaplib.IMAP4,
     conn: mysql.connector.MySQLConnection,
     folder: str,
+    folder_id: int,
     batch_size: int,
     skip_existing: bool,
 ) -> tuple[int, int]:
@@ -458,7 +606,7 @@ def fetch_emails_from_folder(
 
             try:
                 msg = email.message_from_bytes(raw_email)
-                if insert_email(conn, folder, raw_email, msg, skip_existing):
+                if insert_email(conn, folder_id, raw_email, msg, skip_existing):
                     inserted += 1
             except Exception as exc:
                 log.error("Error processing message in '%s': %s",
@@ -531,14 +679,20 @@ def main() -> None:
         db_conn.close()
         sys.exit(0)
 
-    log.info("Folders to process: %s", ", ".join(folders))
+    log.info("Folders to process: %s", ", ".join(f for f, _ in folders))
+
+    # Cache for folder path -> folder id mapping
+    folder_cache: dict[str, int] = {}
 
     total_inserted = 0
     total_messages = 0
 
-    for folder in folders:
+    for folder_path, delimiter in folders:
+        folder_id = get_or_create_folder(
+            db_conn, folder_path, delimiter, folder_cache,
+        )
         inserted, count = fetch_emails_from_folder(
-            imap, db_conn, folder, batch_size, skip_existing,
+            imap, db_conn, folder_path, folder_id, batch_size, skip_existing,
         )
         total_inserted += inserted
         total_messages += count
