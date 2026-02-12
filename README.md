@@ -1,5 +1,3 @@
-**🚧 Work in progress 🚧**
-
 # Imap2MariaDB
 
 Exports all emails from an IMAP account to a MariaDB database.
