@@ -610,10 +610,34 @@ def get_folders(
     # Build a map of all folders with their delimiter
     all_folders: list[tuple[str, str, str | None]] = []
     for item in data:
-        name_encoded, delim = parse_imap_list_response(item)
+        if item is None:
+            continue
+        # imaplib may return (bytes, bytes) tuples when the server sends
+        # folder names as IMAP literals (e.g. {5}\r\nINBOX).  The first
+        # element contains the flags, delimiter and a literal size marker
+        # {n}; the second element is the raw folder name.  We rebuild a
+        # standard LIST response line so parse_imap_list_response can
+        # handle it.
+        if isinstance(item, tuple):
+            prefix = item[0] if isinstance(item[0], bytes) else str(item[0]).encode()
+            literal = item[1] if isinstance(item[1], bytes) else str(item[1]).encode()
+            # Strip the literal size marker {n} from the end of the prefix
+            brace_idx = prefix.rfind(b"{")
+            if brace_idx != -1:
+                prefix = prefix[:brace_idx]
+            # Wrap the literal folder name in quotes to form a valid line
+            item = prefix + b'"' + literal + b'"'
+        try:
+            name_encoded, delim = parse_imap_list_response(item)
+        except Exception as exc:
+            log.warning("Failed to parse IMAP LIST response %r: %s", item, exc)
+            continue
         if name_encoded:
             name_decoded = decode_imap_utf7(name_encoded)
+            log.debug("  Found folder: %s (delimiter=%r)", name_decoded, delim)
             all_folders.append((name_encoded, name_decoded, delim))
+
+    log.debug("Listed %d folder(s) from IMAP server.", len(all_folders))
 
     # If specific folders are configured, filter the list
     if config_folders.strip():
