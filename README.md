@@ -23,13 +23,54 @@ Exports all emails from an IMAP account to a MariaDB database.
 
 ## Installation
 
+### Clone the repository
+
 ```bash
-# Clone the repository
 git clone https://github.com/votre-utilisateur/Imap2MariaDB.git
 cd Imap2MariaDB
+```
 
-# Install dependencies
-pip install -r requirements.txt
+### Create your virtual environment
+
+You can create your virtual environment with Python:
+
+**Under Linux or macOD:**
+
+```bash
+python3 -m venv .venv
+```
+
+**Under Windows:**
+
+```powershell
+python -m venv .venv
+```
+
+### Switch on your new virtual environment
+
+**Under Linux or macOS:**
+
+```bash
+source .venv/bin/activate
+```
+
+**Under Windows:**
+
+ - In **PowerShell**:
+	```powershell
+	.\.venv\Scripts\Activate.ps1
+	```
+
+ - In **Command Prompt**:
+	```batch
+	.venv\Scripts\activate.bat
+	```
+### Install libraries
+
+You will need the Google Auth libraries. You can install them using **pip**:
+
+```
+pip install --require-virtualenv --requirement=requirements.txt
 ```
 
 ## Configuration
@@ -87,6 +128,75 @@ python imap2mariadb.py -v
 
 ## Database schema
 
+### Entity Relationship Diagrams
+
+```mermaid
+---
+title: imap2mariadb
+---
+erDiagram
+	folders |o--o{ folders : parent
+	folders ||--o{ emails : contains
+
+	emails ||--o{ email_references : has
+	emails ||--o{ recipients : has
+	emails ||--o{ headers : has
+	emails ||--o{ attachments : has
+
+	folders {
+		BIGINT        id           PK
+		VARCHAR(255)  name
+		VARCHAR(1024) full_path    UK
+		BIGINT        parent_id    FK
+		VARCHAR(10)   delimiter
+	}
+
+	emails {
+		BIGINT        id              PK
+		VARCHAR(512)  message_id
+		BIGINT        folder_id       FK
+		TEXT          subject
+		VARCHAR(512)  sender_name
+		VARCHAR(512)  sender_address
+		DATETIME      date_sent
+		VARCHAR(512)  in_reply_to
+		LONGTEXT      body_text
+		LONGTEXT      body_html
+		LONGBLOB      raw_source
+		DATETIME      created_at
+	}
+
+	email_references {
+		BIGINT       id                    PK
+		BIGINT       email_id              FK
+		VARCHAR(512) referenced_message_id
+		INT          position
+	}
+
+	recipients {
+		BIGINT       id       PK
+		BIGINT       email_id FK
+		ENUM         type
+		VARCHAR(512) name
+		VARCHAR(512) address
+	}
+
+	headers {
+		BIGINT       id          PK
+		BIGINT       email_id    FK
+		VARCHAR(512) field_name
+		TEXT         field_value
+	}
+
+	attachments {
+		BIGINT       id           PK
+		BIGINT       email_id     FK
+		TEXT         filename
+		VARCHAR(255) content_type
+		BIGINT       size
+	}
+```
+
 ### Table `folders`
 
 Stores the IMAP folder tree. Each folder references its parent via `parent_id`, forming a hierarchy.
@@ -101,20 +211,20 @@ Stores the IMAP folder tree. Each folder references its parent via `parent_id`, 
 
 ### Table `emails`
 
-| Column        | Type         | Description                                           |
-|---------------|--------------|-------------------------------------------------------|
-| id            | BIGINT       | Auto-increment primary key                            |
-| message_id    | VARCHAR(512) | Message-ID header                                     |
-| folder_id     | BIGINT       | Reference to `folders.id`                             |
-| subject       | TEXT         | Message subject                                       |
-| sender_name   | VARCHAR(512) | Sender name                                           |
-| sender_address| VARCHAR(512) | Sender address                                        |
-| date_sent     | DATETIME     | Sent date (UTC)                                       |
-| in_reply_to   | VARCHAR(512) | Message-ID from the In-Reply-To header (indexed)      |
-| body_text     | LONGTEXT     | Plain text body                                       |
-| body_html     | LONGTEXT     | HTML body                                             |
-| raw_source    | LONGBLOB     | Complete raw source (RFC822)                          |
-| created_at    | DATETIME     | Insertion date in database                            |
+| Column         | Type         | Description                                      |
+| -------------- | ------------ | ------------------------------------------------ |
+| id             | BIGINT       | Auto-increment primary key                       |
+| message_id     | VARCHAR(512) | Message-ID header                                |
+| folder_id      | BIGINT       | Reference to `folders.id`                        |
+| subject        | TEXT         | Message subject                                  |
+| sender_name    | VARCHAR(512) | Sender name                                      |
+| sender_address | VARCHAR(512) | Sender address                                   |
+| date_sent      | DATETIME     | Sent date (UTC)                                  |
+| in_reply_to    | VARCHAR(512) | Message-ID from the In-Reply-To header (indexed) |
+| body_text      | LONGTEXT     | Plain text body                                  |
+| body_html      | LONGTEXT     | HTML body                                        |
+| raw_source     | LONGBLOB     | Complete raw source (RFC822)                     |
+| created_at     | DATETIME     | Insertion date in database                       |
 
 Threading relationships are stored as Message-ID strings, not as foreign keys
 to `emails.id`. This means **deleting an email never cascades to related emails**
