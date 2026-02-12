@@ -6,14 +6,14 @@ Exports all emails from an IMAP account to a MariaDB database.
 
 - IMAP connection with SSL/TLS support
 - Export all folders or select specific folders
-- Storage of **raw sources** (RFC822) of each email
+- Storage of **raw sources** ([RFC 822](https://datatracker.ietf.org/doc/html/rfc822)) of each email
 - Extraction of **metadata**: Message-ID, subject, sender, sent date
 - Extraction of **recipients** (From, To, Cc, Bcc, Reply-To) with names and addresses
 - Extraction of **attachment list** with filename, MIME type and size
 - Extraction of message **body** in plain text and HTML
 - Duplicate detection based on Message-ID (incremental mode)
 - Configurable batch processing
-- Automatic decoding of MIME headers (RFC 2047) and character encodings
+- Automatic decoding of MIME headers ([RFC 2047](https://datatracker.ietf.org/doc/html/rfc2047)) and character encodings
 
 ## Prerequisites
 
