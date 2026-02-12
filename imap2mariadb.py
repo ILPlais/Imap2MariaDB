@@ -41,33 +41,33 @@ log = logging.getLogger("imap2mariadb")
 # ---------------------------------------------------------------------------
 SQL_CREATE_FOLDERS = """
 CREATE TABLE IF NOT EXISTS folders (
-    id            BIGINT        UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    name          VARCHAR(255)  NOT NULL,
-    full_path     VARCHAR(1024) NOT NULL,
-    parent_id     BIGINT        UNSIGNED NULL,
-    `delimiter`   VARCHAR(10)   NULL,
-    UNIQUE KEY    uq_full_path (full_path),
-    CONSTRAINT fk_folders_parent FOREIGN KEY (parent_id)
+    id              BIGINT        UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name            VARCHAR(255)  NOT NULL,
+    full_path       VARCHAR(1024) NOT NULL,
+    parent_id       BIGINT        UNSIGNED NULL,
+    `delimiter`     VARCHAR(10)   NULL,
+    UNIQUE KEY      uq_full_path (full_path),
+    CONSTRAINT      fk_folders_parent FOREIGN KEY (parent_id)
         REFERENCES folders(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
 SQL_CREATE_EMAILS = """
 CREATE TABLE IF NOT EXISTS emails (
-    id            BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    message_id    VARCHAR(512) NULL,
-    folder_id     BIGINT       UNSIGNED NOT NULL,
-    subject       TEXT         NULL,
-    sender_name   VARCHAR(512) NULL,
-    sender_address VARCHAR(512) NULL,
-    date_sent     DATETIME     NULL,
-    in_reply_to   VARCHAR(512) NULL,
-    body_text     LONGTEXT     NULL,
-    body_html     LONGTEXT     NULL,
-    raw_source    LONGBLOB     NOT NULL,
-    created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY    uq_message_id_folder (message_id, folder_id),
-    INDEX         idx_in_reply_to (in_reply_to),
+    id              BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    message_id      VARCHAR(512) NULL,
+    folder_id       BIGINT       UNSIGNED NOT NULL,
+    subject         TEXT         NULL,
+    sender_name     VARCHAR(512) NULL,
+    sender_address  VARCHAR(512) NULL,
+    date_sent       DATETIME     NULL,
+    in_reply_to     VARCHAR(512) NULL,
+    body_text       LONGTEXT     NULL,
+    body_html       LONGTEXT     NULL,
+    raw_source      LONGBLOB     NOT NULL,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY      uq_message_id_folder (message_id, folder_id),
+    INDEX           idx_in_reply_to (in_reply_to),
     CONSTRAINT fk_emails_folder FOREIGN KEY (folder_id)
         REFERENCES folders(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -87,23 +87,34 @@ CREATE TABLE IF NOT EXISTS email_references (
 
 SQL_CREATE_RECIPIENTS = """
 CREATE TABLE IF NOT EXISTS recipients (
-    id            BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    email_id      BIGINT       UNSIGNED NOT NULL,
-    type          ENUM('From','To','Cc','Bcc','Reply-To') NOT NULL,
-    name          VARCHAR(512) NULL,
-    address       VARCHAR(512) NULL,
+    id              BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email_id        BIGINT       UNSIGNED NOT NULL,
+    type            ENUM('From','To','Cc','Bcc','Reply-To') NOT NULL,
+    name            VARCHAR(512) NULL,
+    address         VARCHAR(512) NULL,
     CONSTRAINT fk_recipients_email FOREIGN KEY (email_id)
+        REFERENCES emails(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"""
+
+SQL_CREATE_EMAIL_HEADERS = """
+CREATE TABLE IF NOT EXISTS headers (
+    id              BIGINT      UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email_id        BIGINT      UNSIGNED NOT NULL,
+    field_name      VARCHAR(512) NOT NULL,
+    field_value     TEXT        NULL,
+    CONSTRAINT fk_headers_email FOREIGN KEY (email_id)
         REFERENCES emails(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
 SQL_CREATE_ATTACHMENTS = """
 CREATE TABLE IF NOT EXISTS attachments (
-    id            BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    email_id      BIGINT       UNSIGNED NOT NULL,
-    filename      TEXT         NULL,
-    content_type  VARCHAR(255) NULL,
-    size          BIGINT       UNSIGNED NULL,
+    id              BIGINT       UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email_id        BIGINT       UNSIGNED NOT NULL,
+    filename        TEXT         NULL,
+    content_type    VARCHAR(255) NULL,
+    size            BIGINT       UNSIGNED NULL,
     CONSTRAINT fk_attachments_email FOREIGN KEY (email_id)
         REFERENCES emails(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -133,6 +144,11 @@ VALUES (%s, %s, %s)
 SQL_INSERT_RECIPIENT = """
 INSERT INTO recipients (email_id, type, name, address)
 VALUES (%s, %s, %s, %s)
+"""
+
+SQL_INSERT_HEADER = """
+INSERT INTO headers (email_id, field_name, field_value)
+VALUES (%s, %s, %s)
 """
 
 SQL_INSERT_ATTACHMENT = """
@@ -344,6 +360,7 @@ def init_database(conn: mysql.connector.MySQLConnection) -> None:
     cursor.execute(SQL_CREATE_EMAILS)
     cursor.execute(SQL_CREATE_EMAIL_REFERENCES)
     cursor.execute(SQL_CREATE_RECIPIENTS)
+    cursor.execute(SQL_CREATE_EMAIL_HEADERS)
     cursor.execute(SQL_CREATE_ATTACHMENTS)
     conn.commit()
     cursor.close()
@@ -477,6 +494,19 @@ def insert_email(
                 cursor.execute(SQL_INSERT_RECIPIENT, (
                     email_id, header_type, name or None, address or None,
                 ))
+
+        # Insert extra headers (those not already stored in dedicated columns)
+        handled_headers = {
+            "message-id", "subject", "from", "to", "cc", "bcc",
+            "reply-to", "date", "in-reply-to", "references",
+        }
+        for field_name, field_value in msg.items():
+            if field_name.lower() in handled_headers:
+                continue
+            decoded_value = decode_header_value(field_value)
+            cursor.execute(SQL_INSERT_HEADER, (
+                email_id, field_name, decoded_value or None,
+            ))
 
         # Insert attachments
         for filename, content_type, size in attachments:

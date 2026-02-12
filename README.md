@@ -148,6 +148,20 @@ it or that it references**.
 | name     | VARCHAR(512) | Recipient name                          |
 | address  | VARCHAR(512) | Recipient email address                 |
 
+### Table `headers`
+
+Stores additional email headers not already managed in dedicated columns or
+tables. Headers like Subject, From, To, Cc, Bcc, Reply-To, Date, Message-ID,
+In-Reply-To and References are excluded (they are stored in their respective
+columns/tables).
+
+| Column      | Type         | Description                                          |
+|-------------|--------------|------------------------------------------------------|
+| id          | BIGINT       | Auto-increment primary key                           |
+| email_id    | BIGINT       | Reference to `emails.id` (CASCADE on delete)         |
+| field_name  | VARCHAR(512) | Header field name (e.g. `X-Mailer`, `DKIM-Signature`)|
+| field_value | TEXT         | Decoded header value                                 |
+
 ### Table `attachments`
 
 | Column      | Type         | Description                          |
