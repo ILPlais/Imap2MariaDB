@@ -777,10 +777,21 @@ def main() -> None:
     if args.verbose:
         log.setLevel(logging.DEBUG)
 
-    # Load configuration
+    # Load configuration (try UTF-8, then Latin-1 for files from Windows/legacy systems)
     config = configparser.ConfigParser()
-    if not config.read(args.config):
-        log.error("Unable to read configuration file: %s", args.config)
+    try:
+        with open(args.config, encoding="utf-8") as f:
+            config.read_file(f)
+    except UnicodeDecodeError:
+        try:
+            with open(args.config, encoding="latin-1") as f:
+                config.read_file(f)
+            log.debug("Configuration file read with Latin-1 encoding.")
+        except OSError:
+            log.error("Unable to read configuration file: %s", args.config)
+            sys.exit(1)
+    except OSError as e:
+        log.error("Unable to read configuration file: %s: %s", args.config, e)
         sys.exit(1)
 
     imap_cfg = config["imap"]
