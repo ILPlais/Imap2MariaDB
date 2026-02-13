@@ -10,7 +10,9 @@ text and HTML.
 import argparse
 import base64
 import configparser
+import csv
 import email
+from typing import Any
 import email.header
 import email.utils
 import imaplib
@@ -443,8 +445,10 @@ def insert_email(
     raw_bytes: bytes,
     msg: Message,
     skip_existing: bool,
-) -> bool:
-    """Inserts an email and its associated data. Returns True if inserted."""
+) -> tuple[bool, str | None, datetime | None, str | None, str | None]:
+    """Inserts an email and its associated data.
+    Returns (inserted, message_id, date_sent, sender_address, subject).
+    """
     cursor = conn.cursor()
     try:
         message_id = msg.get("Message-ID", "").strip() or None
@@ -453,7 +457,7 @@ def insert_email(
             message_id = message_id.strip("<>")
 
         if skip_existing and email_exists(cursor, message_id, folder_id):
-            return False
+            return (False, None, None, None, None)
 
         subject = decode_header_value(msg.get("Subject"))
         sender = parse_addresses(msg.get("From"))
@@ -515,7 +519,7 @@ def insert_email(
             ))
 
         conn.commit()
-        return True
+        return (True, message_id, date_sent, sender_address, subject or None)
 
     except MySQLError as exc:
         conn.rollback()
@@ -523,7 +527,7 @@ def insert_email(
         if exc.errno == 1062:
             log.debug("Duplicate ignored: Message-ID=%s folder_id=%d",
                       msg.get("Message-ID", "?"), folder_id)
-            return False
+            return (False, None, None, None, None)
         raise
     finally:
         cursor.close()
@@ -683,11 +687,17 @@ def fetch_emails_from_folder(
     skip_existing: bool,
     pbar_total: tqdm,
     display_name: str | None = None,
+    csv_writer: Any = None,
+    csv_file: Any = None,
+    full_path: str | None = None,
 ) -> tuple[int, int]:
     """Fetches and inserts all emails from an IMAP folder.
     Returns (inserted_count, total_count).
     encoded_path: used for IMAP SELECT (server expects UTF-7).
     display_name: optional decoded name for progress bar (default: encoded_path).
+    csv_writer: optional CSV writer to log each inserted email.
+    csv_file: optional file object for the CSV (used to flush after each row).
+    full_path: folder full_path (from folders table) for CSV log; used if csv_writer is set.
     """
     display = display_name or encoded_path
     try:
@@ -738,8 +748,21 @@ def fetch_emails_from_folder(
 
                 try:
                     msg = email.message_from_bytes(raw_email)
-                    if insert_email(conn, folder_id, raw_email, msg, skip_existing):
+                    inserted_flag, mid, dt, sender_addr, subj = insert_email(
+                        conn, folder_id, raw_email, msg, skip_existing
+                    )
+                    if inserted_flag:
                         inserted += 1
+                        if csv_writer is not None and full_path is not None:
+                            csv_writer.writerow([
+                                mid or "",
+                                dt.isoformat() if dt else "",
+                                sender_addr or "",
+                                subj or "",
+                                full_path,
+                            ])
+                            if csv_file is not None:
+                                csv_file.flush()
                 except Exception as exc:
                     tqdm.write(
                         f"ERROR: Error processing message in '{display}': {exc}"
@@ -800,6 +823,7 @@ def main() -> None:
 
     batch_size = int(options.get("batch_size", 100))
     skip_existing = str(options.get("skip_existing", "true")).lower() in ("true", "1", "yes")
+    csv_log_path = (options.get("csv_log") or "").strip()
 
     # Connect to database
     try:
@@ -844,6 +868,20 @@ def main() -> None:
     log.info("Total: %d message(s) across %d folder(s).",
              total_messages, len(folder_infos))
 
+    # Optional CSV log of processed emails
+    csv_file = None
+    csv_writer = None
+    if csv_log_path:
+        csv_file = open(csv_log_path, "a", newline="", encoding="utf-8")
+        if csv_file.tell() == 0:
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow([
+                "message_id", "date_sent", "sender_address", "subject", "full_path"
+            ])
+        else:
+            csv_writer = csv.writer(csv_file)
+        log.info("Logging inserted emails to CSV: %s", csv_log_path)
+
     # Phase 2: process with progress bars
     total_inserted = 0
 
@@ -860,11 +898,16 @@ def main() -> None:
                 imap, db_conn, encoded_path, folder_id,
                 batch_size, skip_existing, pbar_total,
                 display_name=decoded_path,
+                csv_writer=csv_writer,
+                csv_file=csv_file,
+                full_path=decoded_path,
             )
             total_inserted += inserted
             pbar_total.set_postfix(inserted=total_inserted)
 
     # Cleanup
+    if csv_file is not None:
+        csv_file.close()
     try:
         imap.logout()
     except Exception:
