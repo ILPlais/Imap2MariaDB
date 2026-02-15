@@ -20,6 +20,7 @@ import logging
 import re
 import ssl
 import sys
+import time
 from datetime import datetime, timezone
 from email.message import Message
 
@@ -340,6 +341,44 @@ def parse_message_ids(raw: str | None) -> list[str]:
 # Database
 # ---------------------------------------------------------------------------
 
+# MySQL/MariaDB error codes that indicate a transient problem worth retrying.
+TRANSIENT_MYSQL_ERRNOS = {
+    1040,  # ER_CON_COUNT_ERROR   — Too many connections
+    1205,  # ER_LOCK_WAIT_TIMEOUT — Lock wait timeout exceeded
+    1213,  # ER_LOCK_DEADLOCK     — Deadlock found
+    2003,  # CR_CONN_HOST_ERROR   — Can't connect to MySQL server
+    2006,  # CR_SERVER_GONE_ERROR — MySQL server has gone away
+    2013,  # CR_SERVER_LOST       — Lost connection during query
+    2055,  # CR_SERVER_LOST_EXTENDED — Lost connection reading auth packet
+}
+
+# Maximum number of retry attempts for transient DB errors.
+DB_MAX_RETRIES = 3
+# Delay between retries (seconds); doubles after each attempt.
+DB_RETRY_BASE_DELAY = 2
+
+
+def is_transient_db_error(exc: Exception) -> bool:
+    """Returns True if *exc* is a transient database error worth retrying."""
+    if isinstance(exc, mysql.connector.errors.InterfaceError):
+        # InterfaceError covers "MySQL Connection not available" and similar.
+        return True
+    if isinstance(exc, MySQLError) and getattr(exc, "errno", None) in TRANSIENT_MYSQL_ERRNOS:
+        return True
+    return False
+
+
+def format_db_error(exc: Exception) -> str:
+    """Returns a detailed one-line description of a database error."""
+    parts: list[str] = [type(exc).__name__]
+    if hasattr(exc, "errno"):
+        parts.append(f"errno={exc.errno}")
+    if hasattr(exc, "sqlstate") and exc.sqlstate:
+        parts.append(f"sqlstate={exc.sqlstate}")
+    parts.append(str(exc).replace("\n", " "))
+    return " | ".join(parts)
+
+
 def get_db_connection(config: configparser.SectionProxy) -> mysql.connector.MySQLConnection:
     """Creates and returns a MariaDB connection."""
     conn = mysql.connector.connect(
@@ -351,8 +390,64 @@ def get_db_connection(config: configparser.SectionProxy) -> mysql.connector.MySQ
         charset="utf8mb4",
         collation="utf8mb4_unicode_ci",
         autocommit=False,
+        connection_timeout=30,
     )
     return conn
+
+
+def log_db_server_info(conn: mysql.connector.MySQLConnection) -> None:
+    """Queries and logs key server variables for diagnostics."""
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT @@version, @@connection_id, "
+            "@@wait_timeout, @@interactive_timeout, "
+            "@@max_allowed_packet, @@net_read_timeout, "
+            "@@net_write_timeout"
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        if row:
+            version, conn_id, wait_t, inter_t, max_pkt, net_r, net_w = row
+            log.info(
+                "DB server: version=%s  connection_id=%s  "
+                "wait_timeout=%ss  interactive_timeout=%ss  "
+                "max_allowed_packet=%s  "
+                "net_read_timeout=%ss  net_write_timeout=%ss",
+                version, conn_id, wait_t, inter_t,
+                f"{int(max_pkt) / (1024 * 1024):.0f}MB" if max_pkt else "?",
+                net_r, net_w,
+            )
+    except Exception as exc:
+        log.warning("Could not query DB server variables: %s", exc)
+
+
+def ensure_db_connection(
+    conn: mysql.connector.MySQLConnection,
+    db_cfg: configparser.SectionProxy,
+) -> mysql.connector.MySQLConnection:
+    """Ensures the DB connection is alive; reconnects if needed.
+
+    Returns the existing connection if healthy, or a brand-new one
+    if the original was lost.
+    """
+    try:
+        conn.ping(reconnect=True, attempts=2, delay=1)
+        return conn
+    except Exception as exc:
+        log.warning(
+            "DB connection lost (ping failed: %s). Reconnecting…",
+            format_db_error(exc),
+        )
+    # ping failed even after internal reconnect — open a fresh connection
+    try:
+        conn.close()
+    except Exception:
+        pass
+    new_conn = get_db_connection(db_cfg)
+    log.info("DB reconnection successful (new connection_id).")
+    log_db_server_info(new_conn)
+    return new_conn
 
 
 def init_database(conn: mysql.connector.MySQLConnection) -> None:
@@ -439,21 +534,18 @@ def email_exists(cursor, message_id: str | None, folder_id: int) -> bool:
     return cursor.fetchone() is not None
 
 
-def insert_email(
+def _do_insert_email(
     conn: mysql.connector.MySQLConnection,
     folder_id: int,
     raw_bytes: bytes,
     msg: Message,
     skip_existing: bool,
 ) -> tuple[bool, str | None, datetime | None, str | None, str | None]:
-    """Inserts an email and its associated data.
-    Returns (inserted, message_id, date_sent, sender_address, subject).
-    """
+    """Core insertion logic (no retry). Called by :func:`insert_email`."""
     cursor = conn.cursor()
     try:
         message_id = msg.get("Message-ID", "").strip() or None
         if message_id:
-            # Strip angle brackets
             message_id = message_id.strip("<>")
 
         if skip_existing and email_exists(cursor, message_id, folder_id):
@@ -470,6 +562,14 @@ def insert_email(
 
         body_text, body_html = extract_bodies(msg)
         attachments = extract_attachments(msg)
+
+        raw_size = len(raw_bytes)
+        log.debug(
+            "Inserting email: Message-ID=%s  folder_id=%d  raw_size=%d bytes  "
+            "subject=%r  date=%s",
+            message_id, folder_id, raw_size,
+            (subject or "")[:80], date_sent,
+        )
 
         # Insert email
         cursor.execute(SQL_INSERT_EMAIL, (
@@ -522,15 +622,67 @@ def insert_email(
         return (True, message_id, date_sent, sender_address, subject or None)
 
     except MySQLError as exc:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         # Duplicate: message already present (unique constraint)
-        if exc.errno == 1062:
+        if getattr(exc, "errno", None) == 1062:
             log.debug("Duplicate ignored: Message-ID=%s folder_id=%d",
                       msg.get("Message-ID", "?"), folder_id)
             return (False, None, None, None, None)
         raise
     finally:
         cursor.close()
+
+
+def insert_email(
+    conn: mysql.connector.MySQLConnection,
+    db_cfg: configparser.SectionProxy,
+    folder_id: int,
+    raw_bytes: bytes,
+    msg: Message,
+    skip_existing: bool,
+) -> tuple[mysql.connector.MySQLConnection, bool, str | None, datetime | None, str | None, str | None]:
+    """Inserts an email with automatic retry on transient DB errors.
+
+    Returns ``(conn, inserted, message_id, date_sent, sender_address, subject)``.
+    The returned *conn* may differ from the input if a reconnection occurred.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, DB_MAX_RETRIES + 1):
+        try:
+            result = _do_insert_email(conn, folder_id, raw_bytes, msg, skip_existing)
+            return (conn,) + result
+        except Exception as exc:
+            last_exc = exc
+            msg_id = msg.get("Message-ID", "?")
+            if is_transient_db_error(exc):
+                delay = DB_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                log.warning(
+                    "Transient DB error on attempt %d/%d for Message-ID=%s: %s  "
+                    "— retrying in %ds…",
+                    attempt, DB_MAX_RETRIES, msg_id,
+                    format_db_error(exc), delay,
+                )
+                time.sleep(delay)
+                # Try to restore the connection before next attempt
+                conn = ensure_db_connection(conn, db_cfg)
+            else:
+                # Non-transient error: log and raise immediately
+                log.error(
+                    "Non-transient DB error inserting Message-ID=%s folder_id=%d: %s",
+                    msg_id, folder_id, format_db_error(exc),
+                )
+                raise
+
+    # All retries exhausted
+    log.error(
+        "All %d retry attempts failed for Message-ID=%s folder_id=%d. Last error: %s",
+        DB_MAX_RETRIES, msg.get("Message-ID", "?"), folder_id,
+        format_db_error(last_exc) if last_exc else "unknown",
+    )
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +833,7 @@ def count_folder_messages(
 def fetch_emails_from_folder(
     imap: imaplib.IMAP4,
     conn: mysql.connector.MySQLConnection,
+    db_cfg: configparser.SectionProxy,
     encoded_path: str,
     folder_id: int,
     batch_size: int,
@@ -690,33 +843,31 @@ def fetch_emails_from_folder(
     csv_writer: Any = None,
     csv_file: Any = None,
     full_path: str | None = None,
-) -> tuple[int, int]:
+) -> tuple[mysql.connector.MySQLConnection, int, int]:
     """Fetches and inserts all emails from an IMAP folder.
-    Returns (inserted_count, total_count).
-    encoded_path: used for IMAP SELECT (server expects UTF-7).
-    display_name: optional decoded name for progress bar (default: encoded_path).
-    csv_writer: optional CSV writer to log each inserted email.
-    csv_file: optional file object for the CSV (used to flush after each row).
-    full_path: folder full_path (from folders table) for CSV log; used if csv_writer is set.
+
+    Returns ``(conn, inserted_count, total_count)``.
+    The returned *conn* may differ from the input if a reconnection occurred.
     """
     display = display_name or encoded_path
     try:
         status, _ = imap.select(f'"{encoded_path}"', readonly=True)
     except imaplib.IMAP4.error as exc:
         tqdm.write(f"WARNING: Unable to select folder '{display}': {exc}")
-        return 0, 0
+        return conn, 0, 0
 
     if status != "OK":
         tqdm.write(f"WARNING: Unable to select folder '{display}'.")
-        return 0, 0
+        return conn, 0, 0
 
     status, data = imap.search(None, "ALL")
     if status != "OK" or not data[0]:
-        return 0, 0
+        return conn, 0, 0
 
     msg_nums = data[0].split()
     total = len(msg_nums)
     inserted = 0
+    errors_in_folder = 0
 
     with tqdm(
         total=total,
@@ -728,6 +879,19 @@ def fetch_emails_from_folder(
         for i in range(0, total, batch_size):
             batch = msg_nums[i : i + batch_size]
             msg_set = b",".join(batch)
+
+            # Ensure DB connection is alive before each batch
+            try:
+                conn = ensure_db_connection(conn, db_cfg)
+            except Exception as exc:
+                tqdm.write(
+                    f"ERROR: DB reconnection failed before batch {i} "
+                    f"in '{display}': {format_db_error(exc)}"
+                )
+                pbar_folder.update(len(batch))
+                pbar_total.update(len(batch))
+                errors_in_folder += len(batch)
+                continue
 
             status, messages_data = imap.fetch(msg_set, "(RFC822)")
             if status != "OK":
@@ -748,8 +912,8 @@ def fetch_emails_from_folder(
 
                 try:
                     msg = email.message_from_bytes(raw_email)
-                    inserted_flag, mid, dt, sender_addr, subj = insert_email(
-                        conn, folder_id, raw_email, msg, skip_existing
+                    conn, inserted_flag, mid, dt, sender_addr, subj = insert_email(
+                        conn, db_cfg, folder_id, raw_email, msg, skip_existing
                     )
                     if inserted_flag:
                         inserted += 1
@@ -764,17 +928,24 @@ def fetch_emails_from_folder(
                             if csv_file is not None:
                                 csv_file.flush()
                 except Exception as exc:
+                    errors_in_folder += 1
                     tqdm.write(
-                        f"ERROR: Error processing message in '{display}': {exc}"
+                        f"ERROR: Failed to process message in '{display}': "
+                        f"{format_db_error(exc) if isinstance(exc, (MySQLError, mysql.connector.errors.InterfaceError)) else exc}"
                     )
 
                 batch_processed += 1
                 pbar_folder.update(1)
                 pbar_total.update(1)
 
-            pbar_folder.set_postfix(inserted=inserted)
+            pbar_folder.set_postfix(inserted=inserted, errors=errors_in_folder)
 
-    return inserted, total
+    if errors_in_folder:
+        tqdm.write(
+            f"WARNING: Folder '{display}' completed with {errors_in_folder} error(s)."
+        )
+
+    return conn, inserted, total
 
 
 # ---------------------------------------------------------------------------
@@ -828,9 +999,10 @@ def main() -> None:
     # Connect to database
     try:
         db_conn = get_db_connection(db_cfg)
+        log_db_server_info(db_conn)
         init_database(db_conn)
     except MySQLError as exc:
-        log.error("Database connection error: %s", exc)
+        log.error("Database connection error: %s", format_db_error(exc))
         sys.exit(1)
 
     # IMAP connection
@@ -894,8 +1066,8 @@ def main() -> None:
         for encoded_path, decoded_path, delimiter, folder_id, msg_count in folder_infos:
             if msg_count == 0:
                 continue
-            inserted, count = fetch_emails_from_folder(
-                imap, db_conn, encoded_path, folder_id,
+            db_conn, inserted, count = fetch_emails_from_folder(
+                imap, db_conn, db_cfg, encoded_path, folder_id,
                 batch_size, skip_existing, pbar_total,
                 display_name=decoded_path,
                 csv_writer=csv_writer,
@@ -912,7 +1084,10 @@ def main() -> None:
         imap.logout()
     except Exception:
         pass
-    db_conn.close()
+    try:
+        db_conn.close()
+    except Exception:
+        pass
 
     log.info("Done. %d message(s) inserted out of %d processed.",
              total_inserted, total_messages)
